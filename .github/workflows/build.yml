@@ -1,0 +1,111 @@
+name: Build apps
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller pillow
+      - name: Make app.ico from icon.png
+        run: python -c "from PIL import Image; Image.open('icon.png').convert('RGBA').save('app.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+      - name: Build single-file exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name BaturTeacherTalking --icon app.ico
+          --add-data "app.ico;." --add-data "icon.png;."
+          --collect-all soundcard --collect-all sounddevice
+          app.py
+      - name: Self-test
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\BaturTeacherTalking.exe -ArgumentList "--selftest" -PassThru -Wait
+          Get-Content "$env:TEMP\btt_selftest.txt"
+          if ($p.ExitCode -ne 0) { throw "self-test failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/BaturTeacherTalking.exe
+
+  mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14          # Apple silicon (M1/M2/M3/M4)
+            arch: arm64
+          - runner: macos-15-intel    # Intel Macs
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller pillow
+      - name: Build .app
+        run: >
+          pyinstaller --noconfirm --clean --windowed
+          --name "Batur Teacher Talking" --icon icon.png
+          --osx-bundle-identifier com.batur.teachertalking
+          --add-data "icon.png:."
+          --collect-all sounddevice
+          app.py
+      - name: Microphone permission text + ad-hoc signature
+        run: |
+          APP="dist/Batur Teacher Talking.app"
+          plutil -insert NSMicrophoneUsageDescription -string "Batur Teacher Talking listens to the microphone to show live captions." "$APP/Contents/Info.plist"
+          codesign --force --deep -s - "$APP"
+      - name: Self-test
+        run: |
+          BTT_SELFTEST_OUT="$RUNNER_TEMP/st.txt" "dist/Batur Teacher Talking.app/Contents/MacOS/Batur Teacher Talking" --selftest
+          cat "$RUNNER_TEMP/st.txt"
+      - name: Zip
+        run: ditto -c -k --keepParent "dist/Batur Teacher Talking.app" "BaturTeacherTalking-mac-${{ matrix.arch }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.arch }}
+          path: BaturTeacherTalking-mac-${{ matrix.arch }}.zip
+
+  release:
+    needs: [windows, mac]
+    if: ${{ always() && needs.windows.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - run: ls -la out
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Batur Teacher Talking v1.0.${{ github.run_number }}
+          body: |
+            **Windows** — PowerShell:
+            ```
+            irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex
+            ```
+            **Mac** — Terminal:
+            ```
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+            ```
+            Or download the file for your system below.
+          files: out/*
+          make_latest: true
