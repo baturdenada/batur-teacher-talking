@@ -1,0 +1,4 @@
+numpy
+sounddevice
+soundcard>=0.4.4; sys_platform == "win32"
+websockets>=12
