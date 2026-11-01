@@ -1,0 +1,12 @@
+# never upload keys or personal files
+api_key.txt
+gemini api key.txt
+*.key
+settings.json
+*.log
+_gpu_libs/
+__pycache__/
+build/
+dist/
+*.spec
+app.ico
