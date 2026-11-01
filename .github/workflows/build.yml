@@ -108,8 +108,8 @@ jobs:
                   for v in min_versions(subprocess.run(["otool", "-l", p], capture_output=True, text=True).stdout):
                       worst = max(worst, v)
                       if v > limit: bad.add((p[len(app):], ".".join(map(str, v))))
-          print("highest minimum macOS among all binaries:", ".".join(map(str, worst)))
-          for b in sorted(bad): print("TOO NEW:", b)
+          print(f"::notice::highest minimum macOS among all binaries: {'.'.join(map(str, worst))}")
+          for b in sorted(bad): print(f"::error::needs macOS {b[1]}: {b[0]}")
           sys.exit(1 if bad else 0)
           PY
       - name: Self-test
