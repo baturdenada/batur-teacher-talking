@@ -47,18 +47,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15          # Apple silicon (M1/M2/M3/M4)
+          - runner: macos-15          # Apple silicon (M1-M4): app runs on macOS 11 Big Sur and newer
             arch: arm64
-          - runner: macos-15-intel    # Intel Macs
+            min_os: "11.0"
+          - runner: macos-15-intel    # Intel Macs: app runs on macOS 10.13 High Sierra and newer
             arch: x86_64
+            min_os: "10.13"
     runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.min_os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller pillow
+      - name: Install python.org Python 3.11 (built for old macOS)
+        run: |
+          curl -fsSLo py.pkg https://www.python.org/ftp/python/3.11.9/python-3.11.9-macos11.pkg
+          sudo installer -pkg py.pkg -target /
+          PY=/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11
+          $PY -m venv venv
+          echo "$PWD/venv/bin" >> $GITHUB_PATH
+      - name: Install dependencies (wheels that support old macOS)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pillow
       - name: Build .app
         run: >
           pyinstaller --noconfirm --clean --windowed
@@ -67,11 +77,41 @@ jobs:
           --add-data "icon.png:."
           --collect-all sounddevice
           app.py
-      - name: Microphone permission text + ad-hoc signature
+      - name: Microphone permission text, minimum macOS, ad-hoc signature
         run: |
           APP="dist/Batur Teacher Talking.app"
           plutil -insert NSMicrophoneUsageDescription -string "Batur Teacher Talking listens to the microphone to show live captions." "$APP/Contents/Info.plist"
+          plutil -replace LSMinimumSystemVersion -string "${{ matrix.min_os }}" "$APP/Contents/Info.plist"
           codesign --force --deep -s - "$APP"
+      - name: Check every binary runs on macOS ${{ matrix.min_os }}
+        run: |
+          python - "dist/Batur Teacher Talking.app" "${{ matrix.min_os }}" <<'PY'
+          import os, subprocess, sys
+          app, limit = sys.argv[1], tuple(int(x) for x in sys.argv[2].split("."))
+          MAGIC = (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca")
+          def min_versions(text):
+              # LC_BUILD_VERSION -> "minos X.Y" ; LC_VERSION_MIN_MACOSX -> "version X.Y"
+              t, out, in_old = text.split(), [], False
+              for i, w in enumerate(t):
+                  if w == "LC_VERSION_MIN_MACOSX": in_old = True
+                  elif w == "cmd": in_old = False if t[i+1] != "LC_VERSION_MIN_MACOSX" else in_old
+                  if w == "minos" or (w == "version" and in_old):
+                      out.append(tuple(int(x) for x in t[i+1].split(".")))
+              return out
+          worst, bad = (0,), set()
+          for root, _, files in os.walk(app):
+              for f in files:
+                  p = os.path.join(root, f)
+                  if os.path.islink(p): continue
+                  with open(p, "rb") as fh:
+                      if fh.read(4) not in MAGIC: continue
+                  for v in min_versions(subprocess.run(["otool", "-l", p], capture_output=True, text=True).stdout):
+                      worst = max(worst, v)
+                      if v > limit: bad.add((p[len(app):], ".".join(map(str, v))))
+          print("highest minimum macOS among all binaries:", ".".join(map(str, worst)))
+          for b in sorted(bad): print("TOO NEW:", b)
+          sys.exit(1 if bad else 0)
+          PY
       - name: Self-test
         run: |
           BTT_SELFTEST_OUT="$RUNNER_TEMP/st.txt" "dist/Batur Teacher Talking.app/Contents/MacOS/Batur Teacher Talking" --selftest
