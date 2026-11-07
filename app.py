@@ -78,8 +78,8 @@ BACKLOG_SEC    = 25.0          # audio kept while an engine is still loading
 LIVE_STEP_SEC  = 0.12
 MAX_PHRASE_SEC = 12.0
 MIN_PHRASE_SEC = 0.45
-CPU_MODELS = ("base", "small.en")
-GPU_MODELS = ("small.en", "medium")
+CPU_MODELS = ("base.en", "base.en")     # light enough for older laptops (one ~150 MB download)
+GPU_MODELS = ("small.en", "medium")     # 'medium' only if already downloaded, else small.en is reused
 LANGUAGE   = "en"
 
 # Online (Gemini)
@@ -138,7 +138,16 @@ def save_settings(s):
         pass
 
 
-def load_api_key():
+def builtin_key():
+    """Key baked into the release build (generated from a GitHub secret, scrambled)."""
+    try:
+        from _builtin_key import K, M          # created by the build; never in the repo
+        return bytes(a ^ b for a, b in zip(base64.b64decode(K), base64.b64decode(M))).decode()
+    except Exception:
+        return ""
+
+
+def user_api_key():
     k = os.environ.get("GEMINI_API_KEY", "").strip()
     if k:
         return k
@@ -153,9 +162,21 @@ def load_api_key():
     return ""
 
 
+def load_api_key():
+    """Own key (if the user set one) wins; otherwise the built-in key."""
+    return user_api_key() or builtin_key()
+
+
 def save_api_key(k):
     with open(KEY_PATHS[0], "w", encoding="utf-8") as f:
         f.write(k.strip())
+
+
+def clear_user_key():
+    try:
+        os.remove(KEY_PATHS[0])
+    except Exception:
+        pass
 
 
 def com_init():
@@ -418,8 +439,47 @@ class AudioCapture:
 # ─── Local model handling ────────────────────────────────────────────────────
 
 def has_nvidia_driver():
+    if not IS_WIN:
+        return False
     root = os.environ.get("SystemRoot", r"C:\Windows")
     return os.path.exists(os.path.join(root, "System32", "nvcuda.dll"))
+
+
+HW = {"cpu": "", "gpu": ""}      # filled in the background at start-up
+
+
+def detect_hardware():
+    cpu = ""
+    try:
+        if IS_WIN:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                               r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+            cpu = " ".join(str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).split())
+        elif IS_MAC:
+            cpu = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        pass
+    if not cpu:
+        import platform
+        cpu = platform.processor() or "CPU"
+    gpu = ""
+    if has_nvidia_driver():
+        gpu = "NVIDIA GPU"
+        try:
+            import shutil
+            exe = shutil.which("nvidia-smi") or os.path.join(
+                os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvidia-smi.exe")
+            r = subprocess.run([exe, "--query-gpu=name", "--format=csv,noheader"],
+                               capture_output=True, text=True, timeout=8,
+                               creationflags=0x08000000)
+            if r.stdout.strip():
+                gpu = r.stdout.strip().splitlines()[0].strip()
+        except Exception:
+            pass
+    HW["cpu"], HW["gpu"] = cpu, gpu
+    log(f"hardware: CPU={cpu} | GPU={gpu or 'none (no NVIDIA)'}")
 
 
 def _cpu_threads():
@@ -427,6 +487,7 @@ def _cpu_threads():
     return max(2, n // 2)
 
 
+_STATUS_HOOK = None       # set by LocalEngine so model downloads show in the window
 FALLBACKS = ["small.en", "base.en", "base", "small", "tiny.en", "tiny", "medium.en", "medium"]
 
 
@@ -449,6 +510,8 @@ def open_model(name, device, compute_type, **kw):
         except Exception:
             continue
     log(f"downloading '{name}'…")
+    if _STATUS_HOOK:
+        _STATUS_HOOK(f"LOADING:Downloading speech model '{name}' (first time only)…")
     return WhisperModel(name, device=device, compute_type=compute_type, **kw), name
 
 
@@ -493,23 +556,32 @@ def gpu_libs_ready():
            bool(glob.glob(os.path.join(GPU_DIR, "nvidia", "cudnn", "bin", "cudnn_ops64_9.dll")))
 
 
+GPU_WHEELS = [("nvidia-cublas-cu12", "12.9.1.4"), ("nvidia-cudnn-cu12", "9.10.2.21")]
+
+
 def install_gpu_libs(on_status):
-    """One-time silent download of cuBLAS + cuDNN wheels into ./_gpu_libs."""
-    on_status("NVIDIA GPU found — downloading CUDA libraries in background (one time)…")
-    py = sys.executable
-    if py.lower().endswith("pythonw.exe"):
-        alt = py[:-len("pythonw.exe")] + "python.exe"
-        if os.path.exists(alt):
-            py = alt
-    cmd = [py, "-m", "pip", "install", "--disable-pip-version-check",
-           "--no-warn-script-location", "--target", GPU_DIR,
-           "nvidia-cublas-cu12==12.9.1.4", "nvidia-cudnn-cu12==9.10.2.21"]
-    flags = 0x08000000 if os.name == "nt" else 0          # CREATE_NO_WINDOW
+    """One-time download of the NVIDIA cuBLAS + cuDNN DLLs (~1.2 GB) straight from
+    PyPI into GPU_DIR. Works in the .exe too (no pip needed)."""
+    import urllib.request, zipfile, tempfile
+    on_status("NVIDIA GPU found — downloading GPU libraries in the background (one time, ~1.2 GB)…")
     os.makedirs(GPU_DIR, exist_ok=True)
-    r = subprocess.run(cmd, stdout=sys.stdout, stderr=sys.stdout,
-                       creationflags=flags)
+    for pkg, ver in GPU_WHEELS:
+        with urllib.request.urlopen(f"https://pypi.org/pypi/{pkg}/{ver}/json", timeout=30) as r:
+            meta = json.load(r)
+        url = next(u["url"] for u in meta["urls"] if u["filename"].endswith("win_amd64.whl"))
+        tmp = os.path.join(tempfile.gettempdir(), f"btt_{pkg}.whl")
+        log("downloading", url)
+        urllib.request.urlretrieve(url, tmp)
+        with zipfile.ZipFile(tmp) as z:
+            for n in z.namelist():
+                if n.startswith("nvidia/") and "/bin/" in n and n.lower().endswith(".dll"):
+                    z.extract(n, GPU_DIR)
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
     _register_gpu_dlls()
-    return r.returncode == 0 and gpu_libs_ready()
+    return gpu_libs_ready()
 
 
 # ─── Local engine (Whisper on this PC) ───────────────────────────────────────
@@ -536,7 +608,10 @@ class LocalEngine:
         self.level = -90.0
 
     def label(self):
-        return f"Local · {'GPU' if self.device == 'cuda' else 'CPU'}"
+        if self.device == "cuda":
+            return f"Local · GPU ({HW['gpu'] or 'NVIDIA'})"
+        extra = f" · {HW['gpu']} found, GPU libraries downloading…" if HW["gpu"] and not gpu_libs_ready() else ""
+        return f"Local · CPU ({HW['cpu'] or 'processor'}){extra}"
 
     def start(self):
         self._running = True
@@ -546,6 +621,10 @@ class LocalEngine:
         self._running = False
 
     def _boot(self):
+        global _STATUS_HOOK
+        _STATUS_HOOK = self.on_status
+        if not HW["cpu"]:
+            detect_hardware()
         try:
             import faster_whisper  # noqa: F401
         except Exception:
@@ -554,7 +633,8 @@ class LocalEngine:
         try:
             device = "cuda" if has_nvidia_driver() and gpu_libs_ready() else "cpu"
             names = GPU_MODELS if device == "cuda" else CPU_MODELS
-            self.on_status(f"LOADING:Loading speech model on {'GPU' if device == 'cuda' else 'CPU'}…")
+            self.on_status(f"LOADING:Loading speech model on "
+                           f"{'GPU — ' + HW['gpu'] if device == 'cuda' else 'CPU — ' + HW['cpu']}…")
             try:
                 live = get_model(names[0], device)
             except Exception as e:
@@ -895,7 +975,13 @@ class GeminiEngine:
                 self.connected = False
                 msg = str(e)
                 log("gemini connection:", repr(e))
-                if any(s in msg for s in ("API key", "API_KEY", "1007", "1008", "PERMISSION", "403", "401")):
+                kind = type(e).__name__
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                key_problem = (any(t in msg for t in ("API key", "API_KEY", "PERMISSION_DENIED", "1007", "1008"))
+                               or (kind == "InvalidStatus" and status in (400, 401, 403)))
+                if "Proxy" in kind:          # firewall / proxy blocked the connection — not the key
+                    key_problem = False
+                if key_problem:
                     self.on_status("KEY_ERROR")
                     log(traceback.format_exc())
                     await asyncio.sleep(3)
@@ -1052,6 +1138,7 @@ class TeacherTalkingApp:
             self.capture.source = ""
         self._update_src_label()
         self.capture.start()
+        threading.Thread(target=detect_hardware, daemon=True).start()
         self._start_engine(self.mode)
 
         self.root.bind("<Escape>", lambda e: self._quit())
@@ -1168,10 +1255,11 @@ class TeacherTalkingApp:
 
     @staticmethod
     def _local_available():
-        if FROZEN:
+        try:
+            import importlib.util
+            return importlib.util.find_spec("faster_whisper") is not None
+        except Exception:
             return False
-        import importlib.util
-        return importlib.util.find_spec("faster_whisper") is not None
 
     def _paint_mode(self):
         for k, b in self._mode_btns.items():
@@ -1348,7 +1436,14 @@ class TeacherTalkingApp:
             m.add_command(label="🔊  Computer sound on Mac: install BlackHole, then pick it above",
                           state="disabled")
         m.add_separator()
-        m.add_command(label="🔑  Set Gemini API key…", command=self._ask_key)
+        own = bool(user_api_key())
+        m.add_command(label="🔑  Use my own Gemini API key…", command=self._ask_key)
+        if builtin_key():
+            m.add_command(label=("✓  Using built-in key" if not own else "↩  Switch back to the built-in key"),
+                          command=self._use_builtin_key, state="disabled" if not own else "normal")
+        m.add_separator()
+        gpu = HW["gpu"] or "no NVIDIA graphics card"
+        m.add_command(label=f"💻  This computer: {HW['cpu'] or '…'}  |  {gpu}", state="disabled")
 
     def _choose_src(self, src):
         self.capture.set_source(src)
@@ -1365,6 +1460,14 @@ class TeacherTalkingApp:
             n = src or "Default mic"
             txt = "🎤 " + (n[:24] + "…" if len(n) > 25 else n)
         self._src_btn.configure(text=txt + " ▾")
+
+    def _use_builtin_key(self):
+        clear_user_key()
+        self._key_prompted = False
+        if isinstance(self.engine, GeminiEngine):
+            self.engine.set_key(builtin_key())
+            self._set_state("loading", "Connecting — please wait")
+        self._status_var.set("Using the built-in key")
 
     def _ask_key(self, prompt="Paste your Gemini API key:"):
         k = simpledialog.askstring("Gemini API key", prompt, parent=self.root, show="•")
@@ -1405,7 +1508,10 @@ def selftest():
     """Used by the GitHub build: verify every bundled component loads."""
     out = os.environ.get("BTT_SELFTEST_OUT") or os.path.join(os.environ.get("TEMP", DATA_DIR), "btt_selftest.txt")
     lines, ok = [], True
-    for mod in ("numpy", "sounddevice", "websockets", "tkinter") + (("soundcard",) if IS_WIN else ()):
+    mods = ("numpy", "sounddevice", "websockets", "tkinter") + (("soundcard",) if IS_WIN else ())
+    if os.environ.get("BTT_SELFTEST_LOCAL"):
+        mods += ("ctranslate2", "faster_whisper", "faster_whisper.transcribe", "av", "tokenizers", "huggingface_hub")
+    for mod in mods:
         try:
             __import__(mod)
             lines.append(f"ok   {mod}")
@@ -1417,6 +1523,19 @@ def selftest():
         lines.append("ok   tk window")
     except Exception as e:
         lines.append(f"warn tk window: {e!r}")
+    lines.append("builtin key: " + ("yes" if builtin_key() else "NO"))
+    if os.environ.get("BTT_SELFTEST_TRANSCRIBE"):
+        try:      # real end-to-end check of the bundled Local engine
+            from faster_whisper import WhisperModel
+            m = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+            segs, _ = m.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="en")
+            list(segs)
+            lines.append("ok   local transcription (tiny.en on CPU)")
+        except Exception as e:
+            ok = False
+            lines.append(f"FAIL local transcription: {e!r}")
+    if os.environ.get("BTT_SELFTEST_KEY") and not builtin_key():
+        ok = False
     with open(out, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     sys.exit(0 if ok else 1)
