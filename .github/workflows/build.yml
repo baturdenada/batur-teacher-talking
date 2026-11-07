@@ -20,27 +20,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller pillow
+      - name: Install dependencies (incl. Local/Whisper engine)
+        run: pip install -r requirements-local.txt pyinstaller pillow
       - name: Make app.ico from icon.png
         run: python -c "from PIL import Image; Image.open('icon.png').convert('RGBA').save('app.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
-      - name: Build single-file exe
+      - name: Built-in Gemini key (from repo secret, scrambled)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python -c "import os,base64,secrets; k=os.environ['GEMINI_API_KEY'].strip().encode(); m=secrets.token_bytes(len(k)); open('_builtin_key.py','w').write('K=%r\nM=%r\n' % (base64.b64encode(bytes(a^b for a,b in zip(k,m))).decode(), base64.b64encode(m).decode()))"
+      - name: Build app folder
         run: >
-          pyinstaller --noconfirm --clean --onefile --windowed
-          --name BaturTeacherTalking --icon app.ico
+          pyinstaller --noconfirm --clean --windowed
+          --name "Batur Teacher Talking" --icon app.ico
           --add-data "app.ico;." --add-data "icon.png;."
+          --hidden-import _builtin_key
           --collect-all soundcard --collect-all sounddevice
+          --collect-all faster_whisper --collect-all ctranslate2 --collect-all av --collect-all tokenizers
+          --exclude-module onnxruntime --exclude-module torch
           app.py
-      - name: Self-test
+      - name: Self-test (key, all modules, real Local transcription)
         shell: pwsh
+        env:
+          BTT_SELFTEST_KEY: "1"
+          BTT_SELFTEST_LOCAL: "1"
+          BTT_SELFTEST_TRANSCRIBE: "1"
         run: |
-          $p = Start-Process dist\BaturTeacherTalking.exe -ArgumentList "--selftest" -PassThru -Wait
+          $p = Start-Process "dist\Batur Teacher Talking\Batur Teacher Talking.exe" -ArgumentList "--selftest" -PassThru -Wait
           Get-Content "$env:TEMP\btt_selftest.txt"
           if ($p.ExitCode -ne 0) { throw "self-test failed" }
+      - name: Zip
+        shell: pwsh
+        run: 7z a -tzip BaturTeacherTalking-windows.zip ".\dist\Batur Teacher Talking"
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: dist/BaturTeacherTalking.exe
+          path: BaturTeacherTalking-windows.zip
 
   mac:
     strategy:
@@ -69,9 +83,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller pillow
+      - name: Built-in Gemini key (from repo secret, scrambled)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python -c "import os,base64,secrets; k=os.environ['GEMINI_API_KEY'].strip().encode(); m=secrets.token_bytes(len(k)); open('_builtin_key.py','w').write('K=%r\nM=%r\n' % (base64.b64encode(bytes(a^b for a,b in zip(k,m))).decode(), base64.b64encode(m).decode()))"
       - name: Build .app
         run: >
           pyinstaller --noconfirm --clean --windowed
+          --hidden-import _builtin_key
           --name "Batur Teacher Talking" --icon icon.png
           --osx-bundle-identifier com.batur.teachertalking
           --add-data "icon.png:."
@@ -114,7 +133,7 @@ jobs:
           PY
       - name: Self-test
         run: |
-          BTT_SELFTEST_OUT="$RUNNER_TEMP/st.txt" "dist/Batur Teacher Talking.app/Contents/MacOS/Batur Teacher Talking" --selftest
+          BTT_SELFTEST_KEY=1 BTT_SELFTEST_OUT="$RUNNER_TEMP/st.txt" "dist/Batur Teacher Talking.app/Contents/MacOS/Batur Teacher Talking" --selftest
           cat "$RUNNER_TEMP/st.txt"
       - name: Zip
         run: ditto -c -k --keepParent "dist/Batur Teacher Talking.app" "BaturTeacherTalking-mac-${{ matrix.arch }}.zip"
@@ -146,6 +165,6 @@ jobs:
             ```
             curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
             ```
-            Or download the file for your system below.
+            Or download the file for your system below (Windows: unzip, then run "Batur Teacher Talking.exe").
           files: out/*
           make_latest: true
