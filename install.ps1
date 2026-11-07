@@ -8,14 +8,23 @@ $ProgressPreference = "SilentlyContinue"            # makes the download much fa
 $repo    = "baturdenada/batur-teacher-talking"
 $desktop = [Environment]::GetFolderPath("Desktop")
 $dir     = Join-Path $desktop "Batur Teacher Talking"
+# never touch a developer/source copy that lives under the same name
+if (Test-Path (Join-Path $dir "app.py")) { $dir = Join-Path $desktop "Batur Teacher Talking App" }
 $exe     = Join-Path $dir "Batur Teacher Talking.exe"
-$url     = "https://github.com/$repo/releases/latest/download/BaturTeacherTalking.exe"
+$url     = "https://github.com/$repo/releases/latest/download/BaturTeacherTalking-windows.zip"
+$zip     = Join-Path $env:TEMP "BaturTeacherTalking-windows.zip"
 
 Write-Host "Installing Batur Teacher Talking..." -ForegroundColor Cyan
 Get-Process "Batur Teacher Talking" -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 500
+Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+$tmp = Join-Path $env:TEMP ("btt_" + [guid]::NewGuid().ToString("N"))
+Expand-Archive -Path $zip -DestinationPath $tmp -Force
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
-Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
-Write-Host "Downloaded to $dir"
+Remove-Item (Join-Path $dir "_internal") -Recurse -Force -ErrorAction SilentlyContinue   # old version's files only
+Copy-Item -Path (Join-Path $tmp "Batur Teacher Talking\*") -Destination $dir -Recurse -Force
+Remove-Item $tmp, $zip -Recurse -Force -ErrorAction SilentlyContinue
+Write-Host "Installed to $dir"
 
 if ($env:BTT_KEY) {
     $data = Join-Path $env:APPDATA "BaturTeacherTalking"
