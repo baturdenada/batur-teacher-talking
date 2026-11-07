@@ -26,8 +26,12 @@ curl -fsSL https://raw.githubusercontent.com/baturdenada/batur-teacher-talking/m
 ```
 
 Both create a **Batur Teacher Talking** folder on the Desktop with the app inside and
-start it. On first start it asks for the Gemini API key. Run the same command again
-to update.
+start it — it starts recording straight away (a Gemini key is built into the release;
+you can switch to your own key in the 🎤 menu). Run the same command again to update.
+
+The Windows app also has **💻 Local** mode: it detects the processor and NVIDIA graphics
+card, and the first time it is used it downloads a speech model (~150 MB; with an NVIDIA
+card also the GPU libraries, ~1.2 GB, in the background).
 
 Preload the key so the student never sees a prompt:
 
