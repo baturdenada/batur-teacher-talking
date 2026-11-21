@@ -1,4 +1,4 @@
-# Publishes this folder to GitHub as a public repo and triggers the .exe build.
+﻿# Publishes this folder to GitHub as a public repo and triggers the .exe build.
 # Run with publish.bat. First run opens your browser once to log in to GitHub.
 $ErrorActionPreference = "Continue"   # Windows PowerShell 5.1: "Stop" breaks on gh stderr
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -56,6 +56,14 @@ function BlobSha([byte[]]$b) {
     $all = New-Object byte[] ($h.Length + $b.Length)
     [Array]::Copy($h, $all, $h.Length); [Array]::Copy($b, 0, $all, $h.Length, $b.Length)
     (([Security.Cryptography.SHA1]::Create().ComputeHash($all)) | ForEach-Object { $_.ToString("x2") }) -join ""
+}
+
+# 3b) built-in Gemini key: local "gemini api key.txt" (never uploaded) -> repo secret used by the build
+$keyFile = Join-Path $PSScriptRoot "gemini api key.txt"
+if (Test-Path $keyFile) {
+    (Get-Content -Raw -Path $keyFile).Trim() | & $gh secret set GEMINI_API_KEY -R $full
+    if ($LASTEXITCODE -ne 0) { Write-Host "Could not save the Gemini key as a GitHub secret." -ForegroundColor Red; exit 1 }
+    Write-Host "  Gemini key saved as the build secret" -ForegroundColor Green
 }
 
 # 4) upload changed files (GitHub contents API — no git needed)
