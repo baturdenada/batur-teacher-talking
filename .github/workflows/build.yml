@@ -55,6 +55,33 @@ jobs:
         with:
           name: windows
           path: BaturTeacherTalking-windows.zip
+      - name: Build portable single .exe (everything inside)
+        run: >
+          pyinstaller --noconfirm --onefile --windowed
+          --distpath dist1 --workpath build1 --specpath spec1
+          --name "Batur Teacher Talking Portable" --icon "$PWD\app.ico"
+          --add-data "$PWD\app.ico;." --add-data "$PWD\icon.png;."
+          --hidden-import _builtin_key --paths "$PWD"
+          --collect-all soundcard --collect-all sounddevice
+          --collect-all faster_whisper --collect-all ctranslate2 --collect-all av --collect-all tokenizers
+          --exclude-module onnxruntime --exclude-module torch
+          app.py
+      - name: Self-test portable .exe
+        shell: pwsh
+        env:
+          BTT_SELFTEST_KEY: "1"
+          BTT_SELFTEST_LOCAL: "1"
+          BTT_SELFTEST_TRANSCRIBE: "1"
+        run: |
+          Remove-Item "$env:TEMP\btt_selftest.txt" -ErrorAction SilentlyContinue
+          $p = Start-Process "dist1\Batur Teacher Talking Portable.exe" -ArgumentList "--selftest" -PassThru -Wait
+          Get-Content "$env:TEMP\btt_selftest.txt"
+          if ($p.ExitCode -ne 0) { throw "portable self-test failed" }
+          Copy-Item "dist1\Batur Teacher Talking Portable.exe" "BaturTeacherTalking-windows-portable.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: BaturTeacherTalking-windows-portable.exe
 
   mac:
     strategy:
