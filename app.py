@@ -93,6 +93,34 @@ RENEW_FORCE = 9.6 * 60
 
 LOOPBACK = "__loopback__"      # audio-source value meaning "computer sound"
 
+# Translation (shown mirrored under the centre line)
+TRANSLATE_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.1-flash-lite"]
+TR_COLOR      = "#1f4f8f"      # finished translation
+TR_LIVE_COLOR = "#9aaec8"      # translation of the sentence still being spoken
+DIVIDER_COLOR = "#d9dde3"
+RTL_LANGS = {"ar", "he", "fa", "ur", "ps", "sd", "ug", "yi", "dv"}
+LANGUAGES = [   # (name, Google code) — main languages first, then A-Z
+    ("Turkish", "tr"), ("Russian", "ru"), ("Ukrainian", "uk"), ("French", "fr"), ("German", "de"),
+    ("Italian", "it"), ("Spanish", "es"), ("Portuguese", "pt"), ("Arabic", "ar"), ("Persian", "fa"),
+    ("Chinese (Simplified)", "zh-CN"), ("Chinese (Traditional)", "zh-TW"), ("Japanese", "ja"),
+    ("Korean", "ko"), ("Hindi", "hi"), ("Urdu", "ur"), ("Azerbaijani", "az"), ("Kazakh", "kk"),
+    ("Uzbek", "uz"), ("Kyrgyz", "ky"), ("Turkmen", "tk"), ("Tajik", "tg"), ("Georgian", "ka"),
+    ("Armenian", "hy"), ("Belarusian", "be"), ("Polish", "pl"), ("Dutch", "nl"), ("Greek", "el"),
+    ("Hebrew", "he"), ("Swedish", "sv"), ("Norwegian", "no"), ("Danish", "da"), ("Finnish", "fi"),
+    ("Czech", "cs"), ("Slovak", "sk"), ("Hungarian", "hu"), ("Romanian", "ro"), ("Bulgarian", "bg"),
+    ("Serbian", "sr"), ("Croatian", "hr"), ("Bosnian", "bs"), ("Slovenian", "sl"), ("Macedonian", "mk"),
+    ("Albanian", "sq"), ("Lithuanian", "lt"), ("Latvian", "lv"), ("Estonian", "et"), ("Mongolian", "mn"),
+    ("Kurdish (Kurmanji)", "ku"), ("Kurdish (Sorani)", "ckb"), ("Pashto", "ps"), ("Bengali", "bn"),
+    ("Punjabi", "pa"), ("Gujarati", "gu"), ("Marathi", "mr"), ("Tamil", "ta"), ("Telugu", "te"),
+    ("Kannada", "kn"), ("Malayalam", "ml"), ("Sinhala", "si"), ("Nepali", "ne"), ("Thai", "th"),
+    ("Vietnamese", "vi"), ("Indonesian", "id"), ("Malay", "ms"), ("Filipino", "tl"), ("Burmese", "my"),
+    ("Khmer", "km"), ("Lao", "lo"), ("Swahili", "sw"), ("Amharic", "am"), ("Somali", "so"),
+    ("Hausa", "ha"), ("Yoruba", "yo"), ("Igbo", "ig"), ("Zulu", "zu"), ("Afrikaans", "af"),
+    ("Irish", "ga"), ("Welsh", "cy"), ("Icelandic", "is"), ("Catalan", "ca"), ("Basque", "eu"),
+    ("Galician", "gl"), ("Maltese", "mt"), ("Luxembourgish", "lb"), ("Esperanto", "eo"), ("Latin", "la"),
+]
+LANG_NAME = {c: n for n, c in LANGUAGES}
+
 FONT_FAMILY = "Segoe UI" if os.name == "nt" else ("Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans")
 FONT_SIZE   = 22
 BG_COLOR    = "#ffffff"
@@ -163,8 +191,8 @@ def user_api_key():
 
 
 def load_api_key():
-    """Own key (if the user set one) wins; otherwise the built-in key."""
-    return user_api_key() or builtin_key()
+    """Built-in key wins (never ask the user); own key only if no key was built in."""
+    return builtin_key() or user_api_key()
 
 
 def save_api_key(k):
@@ -177,6 +205,16 @@ def clear_user_key():
         os.remove(KEY_PATHS[0])
     except Exception:
         pass
+
+
+def ssl_context():
+    """TLS context with a bundled CA list (python.org builds on macOS ship none)."""
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 def com_init():
@@ -566,12 +604,18 @@ def install_gpu_libs(on_status):
     on_status("NVIDIA GPU found — downloading GPU libraries in the background (one time, ~1.2 GB)…")
     os.makedirs(GPU_DIR, exist_ok=True)
     for pkg, ver in GPU_WHEELS:
-        with urllib.request.urlopen(f"https://pypi.org/pypi/{pkg}/{ver}/json", timeout=30) as r:
+        with urllib.request.urlopen(f"https://pypi.org/pypi/{pkg}/{ver}/json", timeout=30,
+                                    context=ssl_context()) as r:
             meta = json.load(r)
         url = next(u["url"] for u in meta["urls"] if u["filename"].endswith("win_amd64.whl"))
         tmp = os.path.join(tempfile.gettempdir(), f"btt_{pkg}.whl")
         log("downloading", url)
-        urllib.request.urlretrieve(url, tmp)
+        with urllib.request.urlopen(url, timeout=60, context=ssl_context()) as r, open(tmp, "wb") as fh:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                fh.write(chunk)
         with zipfile.ZipFile(tmp) as z:
             for n in z.namelist():
                 if n.startswith("nvidia/") and "/bin/" in n and n.lower().endswith(".dll"):
@@ -949,6 +993,7 @@ class GeminiEngine:
                 self.on_status("LOADING:Connecting to Gemini…")
             try:
                 async with websockets.connect(f"{WS_URL}?key={self.api_key}", max_size=None,
+                                              ssl=ssl_context(),
                                               open_timeout=15, ping_interval=20,
                                               ping_timeout=20) as ws:
                     await ws.send(json.dumps({"setup": {
@@ -977,14 +1022,15 @@ class GeminiEngine:
                 log("gemini connection:", repr(e))
                 kind = type(e).__name__
                 status = getattr(getattr(e, "response", None), "status_code", None)
-                key_problem = (any(t in msg for t in ("API key", "API_KEY", "PERMISSION_DENIED", "1007", "1008"))
-                               or (kind == "InvalidStatus" and status in (400, 401, 403)))
+                key_problem = (any(t in msg for t in ("API key not valid", "API_KEY_INVALID", "API key expired"))
+                               or (kind == "InvalidStatus" and status in (401, 403)))
                 if "Proxy" in kind:          # firewall / proxy blocked the connection — not the key
                     key_problem = False
                 if key_problem:
-                    self.on_status("KEY_ERROR")
+                    self.on_status("KEY_ERROR:" + msg[:160])
                     log(traceback.format_exc())
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
                 else:
                     self.on_status(f"LOADING:Reconnecting to Gemini… ({msg[:60]})")
                     await asyncio.sleep(backoff)
@@ -1088,6 +1134,111 @@ class GeminiEngine:
                 self._renew = True
 
 
+# ─── Translation ─────────────────────────────────────────────────────────────
+
+def _gemini_translate(text, lang_code, key):
+    import urllib.request, urllib.error
+    lang = LANG_NAME.get(lang_code, lang_code)
+    body = json.dumps({
+        "systemInstruction": {"parts": [{"text":
+            "You translate live English speech from an English lesson for the students. "
+            "Translate the user's text into " + lang + ". Keep the meaning natural and use the "
+            "standard grammar terms of that language. Reply with the translation only — no quotes, "
+            "no notes. If the text is an unfinished sentence, translate it as unfinished."}]},
+        "contents": [{"parts": [{"text": text}]}],
+        "generationConfig": {"temperature": 0},
+    }).encode()
+    last = None
+    for model in TRANSLATE_MODELS:
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            data=body, headers={"x-goog-api-key": key, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10, context=ssl_context()) as r:
+                j = json.load(r)
+            return "".join(p.get("text", "") for p in j["candidates"][0]["content"]["parts"]).strip()
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code == 404:          # model retired → try the next one
+                continue
+            raise
+    raise last
+
+
+def _google_translate(text, lang_code):
+    """Backup: Google Translate's public web endpoint (no key)."""
+    import urllib.request, urllib.parse
+    url = ("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&dt=t&tl="
+           + urllib.parse.quote(lang_code) + "&q=" + urllib.parse.quote(text))
+    with urllib.request.urlopen(url, timeout=8, context=ssl_context()) as r:
+        j = json.load(r)
+    return "".join(seg[0] for seg in j[0] if seg and seg[0]).strip()
+
+
+def translate(text, lang_code):
+    key = load_api_key()
+    if key:
+        try:
+            return _gemini_translate(text, lang_code, key)
+        except Exception as e:
+            log("gemini translate failed, using Google:", repr(e))
+    return _google_translate(text, lang_code)
+
+
+class Translator:
+    """Two workers: finished sentences are translated in order; the sentence that is
+    still being spoken is re-translated (latest text only) for the grey live line."""
+
+    def __init__(self, post):
+        self.post = post                 # post(kind, ident, translation)
+        self._final_q = queue.Queue()
+        self._live = None                # (seq, text, lang)
+        self._live_ev = threading.Event()
+        self._cache = {}
+        threading.Thread(target=self._final_loop, daemon=True).start()
+        threading.Thread(target=self._live_loop, daemon=True).start()
+
+    def _tr(self, text, lang):
+        k = (text, lang)
+        if k not in self._cache:
+            self._cache[k] = translate(text, lang)
+            if len(self._cache) > 500:
+                self._cache.pop(next(iter(self._cache)))
+        return self._cache[k]
+
+    def final(self, idx, text, lang):
+        self._final_q.put((idx, text, lang))
+
+    def live(self, seq, text, lang):
+        self._live = (seq, text, lang)
+        self._live_ev.set()
+
+    def _final_loop(self):
+        while True:
+            idx, text, lang = self._final_q.get()
+            try:
+                self.post("final", idx, self._tr(text, lang))
+            except Exception as e:
+                log("translate error:", repr(e))
+                self.post("final", idx, "")
+
+    def _live_loop(self):
+        done = None
+        while True:
+            self._live_ev.wait()
+            self._live_ev.clear()
+            time.sleep(0.25)                 # gather a few more words first
+            job = self._live
+            if not job or job == done:
+                continue
+            seq, text, lang = job
+            try:
+                self.post("live", seq, self._tr(text, lang))
+            except Exception as e:
+                log("live translate error:", repr(e))
+            done = job
+
+
 # ─── GUI ─────────────────────────────────────────────────────────────────────
 
 PILL = {
@@ -1124,6 +1275,13 @@ class TeacherTalkingApp:
         self._gen = 0
         self.engine = None
         self.mode = self.settings.get("mode", "online")
+        # translation state
+        self.tr_lang = self.settings.get("translate") or None
+        self._tr_items = []           # [[sentence, translation-or-None], …] in spoken order
+        self._tr_live = ""            # translation of the sentence still being spoken
+        self._tr_live_src = ""
+        self._tr_seq = 0
+        self.translator = Translator(lambda kind, ident, tr: self._ui_q.put(("tr_" + kind, None, ident, tr)))
 
         self._build_ui()
         if self.mode == "local" and not self.local_available:
@@ -1205,6 +1363,21 @@ class TeacherTalkingApp:
         self._src_btn.configure(menu=self._src_menu)
         self._src_btn.pack(side="right", padx=6, pady=8)
 
+        # translation picker
+        self._tr_var = tk.StringVar(value=self.tr_lang or "")
+        self._tr_btn = tk.Menubutton(top, text="🌐 Translate: Off ▾", font=(FONT_FAMILY, 10),
+                                     bg="#e2e2e2", activebackground="#d4d4d4",
+                                     relief="flat", padx=12, pady=4)
+        self._tr_menu = tk.Menu(self._tr_btn, tearoff=0, font=(FONT_FAMILY, 10))
+        self._tr_menu.add_radiobutton(label="Off", variable=self._tr_var, value="",
+                                      command=lambda: self._set_tr_lang(None))
+        for i, (name, code) in enumerate(LANGUAGES):
+            self._tr_menu.add_radiobutton(label=name, variable=self._tr_var, value=code,
+                                          columnbreak=(i > 0 and (i + 1) % 30 == 0),
+                                          command=lambda c=code: self._set_tr_lang(c))
+        self._tr_btn.configure(menu=self._tr_menu)
+        self._tr_btn.pack(side="right", padx=6, pady=8)
+
         # Local / Online switch
         sw = tk.Frame(top, bg="#cfcfcf", padx=1, pady=1)
         sw.pack(side="right", padx=8, pady=9)
@@ -1218,6 +1391,8 @@ class TeacherTalkingApp:
 
         frame = tk.Frame(self.root, bg=BG_COLOR)
         frame.pack(fill="both", expand=True, padx=36, pady=(20, 10))
+        frame.grid_columnconfigure(0, weight=1)
+        self._frame = frame
 
         self._text = tk.Text(
             frame, wrap="word", font=(FONT_FAMILY, FONT_SIZE),
@@ -1226,8 +1401,21 @@ class TeacherTalkingApp:
             insertbackground=BG_COLOR, cursor="arrow",
             spacing2=6, spacing3=10,
         )
-        self._text.pack(fill="both", expand=True)
+        self._text.grid(row=0, column=0, sticky="nsew")
         self._text.tag_configure("live", foreground=LIVE_COLOR)
+
+        # soft grey centre line + mirrored translation pane (newest right under the line)
+        self._divider = tk.Frame(frame, bg=DIVIDER_COLOR, height=2)
+        self._trtext = tk.Text(
+            frame, wrap="word", font=(FONT_FAMILY, FONT_SIZE - 2),
+            fg=TR_COLOR, bg=BG_COLOR, relief="flat", bd=0,
+            highlightthickness=0, padx=6, pady=8,
+            insertbackground=BG_COLOR, cursor="arrow",
+            spacing2=6, spacing3=10,
+        )
+        self._trtext.tag_configure("trlive", foreground=TR_LIVE_COLOR)
+        self._trtext.tag_configure("rtl", justify="right")
+        self._trtext.configure(state="disabled")
         # [committed lines] tail [grey live lines] pad \n [spacer]
         # Spacer = half the window, so scrolling to the bottom keeps the newest
         # line in the vertical centre.
@@ -1245,13 +1433,86 @@ class TeacherTalkingApp:
         self._hint = tk.Label(frame, text="", font=(FONT_FAMILY, 26), fg="#b5b5b5", bg=BG_COLOR)
 
         sb = tk.Scrollbar(frame, command=self._text.yview, width=6, bg="#ccc")
-        sb.place(relx=1.0, rely=0, relheight=1, anchor="ne")
+        sb.place(in_=self._text, relx=1.0, rely=0, relheight=1, anchor="ne")
         self._text.configure(yscrollcommand=sb.set)
 
         self._status_var = tk.StringVar(value="Starting…")
         tk.Label(self.root, textvariable=self._status_var, font=(FONT_FAMILY, 9),
                  bg="#f7f7f7", fg="#888", anchor="w"
                  ).pack(fill="x", side="bottom", padx=16, pady=(2, 6))
+        self._apply_tr_layout()
+
+    # ── translation ───────────────────────────────────────────────────────
+    def _apply_tr_layout(self):
+        f = self._frame
+        if self.tr_lang:
+            f.grid_rowconfigure(0, weight=1, uniform="half")
+            f.grid_rowconfigure(2, weight=1, uniform="half")
+            self._divider.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+            self._trtext.grid(row=2, column=0, sticky="nsew")
+            self._tr_btn.configure(text=f"🌐 {LANG_NAME.get(self.tr_lang, self.tr_lang)} ▾",
+                                   bg="#dbeafe")
+        else:
+            f.grid_rowconfigure(0, weight=1, uniform="")
+            f.grid_rowconfigure(2, weight=0, uniform="")
+            self._divider.grid_remove()
+            self._trtext.grid_remove()
+            self._tr_btn.configure(text="🌐 Translate: Off ▾", bg="#e2e2e2")
+        self.root.after(50, self._resize_spacer)
+
+    def _resize_spacer(self):
+        h = self._text.winfo_height()
+        # with translation: newest line sits at the bottom of the upper pane (= window centre)
+        target = 4 if self.tr_lang else max(40, h // 2 - FONT_SIZE)
+        self._spacer.configure(height=target)
+        self._scroll_center()
+
+    def _set_tr_lang(self, code):
+        self.tr_lang = code
+        self._tr_var.set(code or "")
+        self.settings["translate"] = code or ""
+        save_settings(self.settings)
+        self._apply_tr_layout()
+        self._tr_live, self._tr_live_src = "", ""
+        self._tr_seq += 1
+        if code:      # re-translate what is on screen (latest 30 sentences)
+            for i, item in enumerate(self._tr_items):
+                item[1] = None if i >= len(self._tr_items) - 30 else ""
+                if item[1] is None:
+                    self.translator.final(i, item[0], code)
+            self._request_live_tr()
+        self._render_translations()
+
+    def _request_live_tr(self):
+        if not self.tr_lang:
+            return
+        src = " ".join(x for x in self._pending.values() if x).strip()
+        if src == self._tr_live_src:
+            return
+        self._tr_live_src = src
+        self._tr_seq += 1
+        if src:
+            self.translator.live(self._tr_seq, src, self.tr_lang)
+        else:
+            self._tr_live = ""
+            self._render_translations()
+
+    def _render_translations(self):
+        if not self.tr_lang:
+            return
+        t = self._trtext
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        rtl = ("rtl",) if self.tr_lang in RTL_LANGS else ()
+        lines = []
+        if self._tr_live:
+            lines.append((self._tr_live, ("trlive",) + rtl))
+        for src, tr in reversed(self._tr_items[-200:]):           # mirror: newest first
+            lines.append((tr if tr else ("…" if tr is None else ""), (() if tr else ("trlive",)) + rtl))
+        for i, (txt, tags) in enumerate(lines):
+            t.insert("end", ("\n" if i else "") + txt, tags)
+        t.configure(state="disabled")
+        t.yview_moveto(0.0)
 
     @staticmethod
     def _local_available():
@@ -1287,20 +1548,29 @@ class TeacherTalkingApp:
                "ready": "Ready — start talking",
                "error": self._pill.cget("text")[3:]}[self._state]
         self._hint.configure(text=msg, fg="#2f9e55" if self._state == "ready" else "#b5b5b5")
-        self._hint.place(relx=0.5, rely=0.42, anchor="center")
+        self._hint.place(relx=0.5, rely=0.25 if self.tr_lang else 0.42, anchor="center")
 
     # ── text rendering ────────────────────────────────────────────────────
     def _has_text_before_tail(self):
         return self._text.compare("tail", ">", "1.0")
 
     def _on_resize(self, ev):
-        h = max(40, ev.height // 2 - FONT_SIZE)
+        h = 4 if self.tr_lang else max(40, ev.height // 2 - FONT_SIZE)
         if abs(int(self._spacer.cget("height")) - h) > 2:
             self._spacer.configure(height=h)
             self._scroll_center()
 
     def _scroll_center(self):
-        self._text.yview_moveto(1.0)
+        t = self._text
+        t.yview_moveto(1.0)
+        if self.tr_lang:
+            # sit the newest line right on the centre divider (no empty line under it)
+            t.update_idletasks()
+            info = t.dlineinfo("pad -1c")
+            if info:
+                gap = t.winfo_height() - (info[1] + info[3]) - 6
+                if gap > 0:
+                    t.yview_scroll(-gap, "pixels")
 
     def _render_tail(self):
         t = self._text
@@ -1312,6 +1582,7 @@ class TeacherTalkingApp:
             t.insert("tail", sep + live, ("live",))
         t.configure(state="disabled")
         self._scroll_center()
+        self._request_live_tr()
 
     def _commit(self, text):
         t = self._text
@@ -1321,6 +1592,12 @@ class TeacherTalkingApp:
         t.mark_set("tail", f"tail + {len(sep + text)}c")
         t.configure(state="disabled")
         self._word_count += len(text.split())
+        self._tr_items.append([text, None if self.tr_lang else ""])
+        if self.tr_lang:
+            self.translator.final(len(self._tr_items) - 1, text, self.tr_lang)
+            self._tr_live, self._tr_live_src = "", ""      # the live line became this sentence
+            self._tr_seq += 1
+            self._render_translations()
 
     # ── queue pump ────────────────────────────────────────────────────────
     def _poll(self):
@@ -1334,6 +1611,14 @@ class TeacherTalkingApp:
                     if a > self._last_final:
                         self._pending[a] = b
                         changed = True
+                elif kind == "tr_final":
+                    if 0 <= a < len(self._tr_items) and self._tr_items[a][1] is None:
+                        self._tr_items[a][1] = b or ""
+                        self._render_translations()
+                elif kind == "tr_live":
+                    if a == self._tr_seq and self.tr_lang:
+                        self._tr_live = b
+                        self._render_translations()
                 elif kind == "final":
                     for k in [k for k in self._pending if k < a]:
                         self._pending.pop(k)
@@ -1365,16 +1650,11 @@ class TeacherTalkingApp:
             self._set_state("error", m[6:])
             self._status_var.set(m[6:])
         elif m == "KEY_MISSING":
-            self._set_state("error", "Gemini API key needed")
-            if not self._key_prompted:
-                self._key_prompted = True
-                self.root.after(200, self._ask_key)
-        elif m == "KEY_ERROR":
-            self._set_state("error", "Gemini rejected the API key")
-            if not self._key_prompted:
-                self._key_prompted = True
-                self.root.after(200, lambda: self._ask_key(
-                    "Gemini rejected this API key.\nPaste a valid Gemini API key:"))
+            self._set_state("error", "No Gemini key in this build — use Local")
+            self._status_var.set("This build has no built-in Gemini key. Switch to Local.")
+        elif m.startswith("KEY_ERROR"):
+            self._set_state("error", "Gemini key problem — retrying")
+            self._status_var.set("Gemini said: " + m[10:])
         else:
             self._status_var.set(m)
 
@@ -1392,11 +1672,17 @@ class TeacherTalkingApp:
         t.configure(state="disabled")
         self._pending.clear()
         self._word_count = 0
+        self._tr_items.clear()
+        self._tr_live, self._tr_live_src = "", ""
+        self._tr_seq += 1
+        self._render_translations()
         self._update_hint()
         self._status_var.set("Cleared — still listening…")
 
     def _copy(self):
         content = self._text.get("1.0", "pad").strip()
+        if self.tr_lang and self._tr_items:      # sentence + its translation
+            content = "\n\n".join(f"{s}\n{t}" if t else s for s, t in self._tr_items)
         self.root.clipboard_clear()
         self.root.clipboard_append(content)
         self._status_var.set("Copied! — still listening…")
@@ -1435,12 +1721,6 @@ class TeacherTalkingApp:
         else:
             m.add_command(label="🔊  Computer sound on Mac: install BlackHole, then pick it above",
                           state="disabled")
-        m.add_separator()
-        own = bool(user_api_key())
-        m.add_command(label="🔑  Use my own Gemini API key…", command=self._ask_key)
-        if builtin_key():
-            m.add_command(label=("✓  Using built-in key" if not own else "↩  Switch back to the built-in key"),
-                          command=self._use_builtin_key, state="disabled" if not own else "normal")
         m.add_separator()
         gpu = HW["gpu"] or "no NVIDIA graphics card"
         m.add_command(label=f"💻  This computer: {HW['cpu'] or '…'}  |  {gpu}", state="disabled")
@@ -1524,6 +1804,15 @@ def selftest():
     except Exception as e:
         lines.append(f"warn tk window: {e!r}")
     lines.append("builtin key: " + ("yes" if builtin_key() else "NO"))
+    if os.environ.get("BTT_SELFTEST_TRANSLATE"):
+        try:
+            tr = translate("Good morning, everyone.", "tr")
+            lines.append(f"ok   translation to Turkish: {tr}")
+            if not tr:
+                ok = False
+        except Exception as e:
+            ok = False
+            lines.append(f"FAIL translation: {e!r}")
     if os.environ.get("BTT_SELFTEST_TRANSCRIBE"):
         try:      # real end-to-end check of the bundled Local engine
             from faster_whisper import WhisperModel
