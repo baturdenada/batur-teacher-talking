@@ -86,7 +86,7 @@ LANGUAGE   = "en"
 MODEL       = "models/gemini-3.5-transcribe-live"
 WS_URL      = ("wss://generativelanguage.googleapis.com/ws/"
                "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent")
-LANGUAGES   = ["en-US"]
+SPEECH_LANGS = ["en-US"]      # what the teacher speaks (sent to Gemini)
 SEND_SEC    = 0.10
 RENEW_AFTER = 8.5 * 60
 RENEW_FORCE = 9.6 * 60
@@ -999,7 +999,7 @@ class GeminiEngine:
                     await ws.send(json.dumps({"setup": {
                         "model": MODEL,
                         "generationConfig": {"responseModalities": ["TEXT"]},
-                        "inputAudioTranscription": {"languageCodes": LANGUAGES},
+                        "inputAudioTranscription": {"languageCodes": SPEECH_LANGS},
                     }}))
                     first = json.loads(await asyncio.wait_for(ws.recv(), 15))
                     if "setupComplete" not in first:
