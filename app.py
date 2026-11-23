@@ -352,7 +352,10 @@ def wrong_language(text, want):
     return best != want and score[best] >= 2 and score[best] >= 2 * score.get(want, 0) + 1
 
 
-FORCE_FINAL_SEC = 1.0    # pause after which we finish the sentence ourselves if Gemini hasn't
+FORCE_FINAL_SEC = 1.2    # pause after which we finish the sentence ourselves if Gemini hasn't…
+FORCE_STABLE_SEC = 0.8   # …and only once the grey text has stopped changing for this long
+FORCE_FINAL_SEC_EN = 2.5 # English: Gemini finalizes by itself, we only step in as a fallback
+TAIL_GRACE_SEC = 0.45    # words arriving this soon after new speech starts still belong to the last sentence
 
 
 # ─── Audio capture ───────────────────────────────────────────────────────────
@@ -1033,6 +1036,10 @@ class GeminiEngine:
         self._awaiting_final = False
         self._committed = ""        # text we finalized ourselves inside Gemini's still-open turn
         self._last_interim = ""
+        self._last_interim_t = 0.0
+        self._tail_until = 0.0       # late words before this time are added to the last sentence
+        self._last_forced_kept = False
+        self.on_append = None        # set by the app: on_append(text) adds words to the last sentence
         self._renew = False
         self._ever_connected = False
 
@@ -1168,6 +1175,11 @@ class GeminiEngine:
                     speech_run = speech_run + 1 if is_sp else 0
                     if speech_run >= 3:                       # 90 ms of voice → start
                         in_speech, silence = True, 0.0
+                        if self._awaiting_final:          # new sentence: close the previous one now
+                            self._awaiting_final = False
+                            self._force_final()
+                        if self._tail_until == float("inf"):
+                            self._tail_until = time.time() + TAIL_GRACE_SEC
                         out, out_n = list(pre), sum(len(x) for x in pre)
                         pre = []
                 else:
@@ -1182,7 +1194,9 @@ class GeminiEngine:
             # source went quiet without delivering frames (e.g. device switch)
             if in_speech and now - last_frame_t > SILENCE_END + 0.2:
                 await end_turn()
-            if self._awaiting_final and now - final_wait_since > FORCE_FINAL_SEC:
+            wait = FORCE_FINAL_SEC_EN if self.lang == "en" else FORCE_FINAL_SEC
+            if (self._awaiting_final and now - final_wait_since > wait
+                    and now - self._last_interim_t > FORCE_STABLE_SEC):
                 # Gemini only finalizes some languages after long silence: finish it ourselves
                 self._awaiting_final = False
                 self._force_final()
@@ -1205,9 +1219,24 @@ class GeminiEngine:
         if wrong_language(text, self.lang):
             log(f"ignored (not {self.lang}): {text[:90]}")
             text = ""
+        self._last_forced_kept = bool(text)
+        self._tail_until = float("inf")          # open until the next sentence starts
         self.on_final(self._pid, text)
         log(f"#{self._pid} (closed by pause): {text[:90]}")
         self._pid += 1
+
+    def _take_tail(self, full):
+        """Late words of a sentence we already closed: add them to that sentence."""
+        if time.time() > self._tail_until:
+            return False
+        extra = strip_committed(full, self._committed)
+        if not extra:
+            return True
+        self._committed = full
+        if self._last_forced_kept and self.on_append and not wrong_language(extra, self.lang):
+            self.on_append(extra)
+            log(f"late words added to #{self._pid - 1}: {extra[:60]}")
+        return True
 
     async def _recv_loop(self, ws):
         async for raw in ws:
@@ -1219,13 +1248,23 @@ class GeminiEngine:
             it = sc.get("interimInputTranscription")
             if it is not None:
                 full = clean_simple(it.get("text", ""))
+                if full != self._last_interim:
+                    self._last_interim_t = time.time()
                 self._last_interim = full
+                if self._take_tail(full):
+                    self.on_live(self._pid, "")
+                    continue
                 live = strip_committed(full, self._committed)
                 self.on_live(self._pid, "" if wrong_language(live, self.lang) else live)
             ft = sc.get("inputTranscription")
             if ft is not None:
-                text = strip_committed(clean_simple(ft.get("text", "")), self._committed)
+                full = clean_simple(ft.get("text", ""))
+                if self._take_tail(full):
+                    text = ""
+                else:
+                    text = strip_committed(full, self._committed)
                 self._committed, self._last_interim = "", ""
+                self._tail_until = 0.0
                 if wrong_language(text, self.lang):
                     log(f"ignored (not {self.lang}): {text[:90]}")
                     text = ""
@@ -1436,6 +1475,7 @@ class TeacherTalkingApp:
             self.engine = LocalEngine(self.audio_q, lang=self.src_lang, **cb)
         else:
             self.engine = GeminiEngine(self.audio_q, load_api_key(), lang=self.src_lang, **cb)
+            self.engine.on_append = lambda t: self._ui_q.put(("append", g, t, None))
         self.mode = mode
         self._pending.clear()
         self._last_final = 0
@@ -1832,6 +1872,23 @@ class TeacherTalkingApp:
             self._tr_seq += 1
             self._render_translations()
 
+    def _append(self, extra):
+        """Add late-arriving words to the end of the last finished sentence."""
+        if not self._tr_items:
+            return self._commit(extra)
+        t = self._text
+        t.configure(state="normal")
+        t.insert("tail", " " + extra)
+        t.mark_set("tail", f"tail + {len(extra) + 1}c")
+        t.configure(state="disabled")
+        self._word_count += len(extra.split())
+        item = self._tr_items[-1]
+        item[0] = item[0] + " " + extra
+        if self.tr_lang and item[1] != "":
+            item[1] = None
+            self.translator.final(len(self._tr_items) - 1, item[0], (self.src_lang, self.tr_lang))
+            self._render_translations()
+
     # ── queue pump ────────────────────────────────────────────────────────
     def _poll(self):
         changed = False
@@ -1844,6 +1901,9 @@ class TeacherTalkingApp:
                     if a > self._last_final:
                         self._pending[a] = b
                         changed = True
+                elif kind == "append":
+                    self._append(a)
+                    changed = True
                 elif kind == "tr_final":
                     if 0 <= a < len(self._tr_items) and self._tr_items[a][1] is None:
                         self._tr_items[a][1] = b or ""
