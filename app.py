@@ -100,7 +100,7 @@ TR_LIVE_COLOR = "#9aaec8"      # translation of the sentence still being spoken
 DIVIDER_COLOR = "#d9dde3"
 RTL_LANGS = {"ar", "he", "fa", "ur", "ps", "sd", "ug", "yi", "dv"}
 LANGUAGES = [   # (name, Google code) — main languages first, then A-Z
-    ("Turkish", "tr"), ("Russian", "ru"), ("Ukrainian", "uk"), ("French", "fr"), ("German", "de"),
+    ("English", "en"), ("Turkish", "tr"), ("Russian", "ru"), ("Ukrainian", "uk"), ("French", "fr"), ("German", "de"),
     ("Italian", "it"), ("Spanish", "es"), ("Portuguese", "pt"), ("Arabic", "ar"), ("Persian", "fa"),
     ("Chinese (Simplified)", "zh-CN"), ("Chinese (Traditional)", "zh-TW"), ("Japanese", "ja"),
     ("Korean", "ko"), ("Hindi", "hi"), ("Urdu", "ur"), ("Azerbaijani", "az"), ("Kazakh", "kk"),
@@ -287,7 +287,30 @@ def clean_text(text):
 
 
 def clean_simple(t):
-    return " ".join((t or "").split())
+    t = " ".join((t or "").split())
+    # "everyone.Today" -> "everyone. Today" (lowercase word, then a new capitalized sentence)
+    return re.sub(r"(?<=[^\W\d_]{2})([.!?…])(?=[¿¡]?[^\W\d_])",
+                  lambda m: m.group(1) + " " if t[m.end()-1:m.end()].islower() is False and
+                  (t[m.end()] in "¿¡" or t[m.end()].isupper()) and t[m.start()-1].islower()
+                  else m.group(1), t)
+
+
+def strip_committed(text, committed):
+    """Gemini keeps growing one transcript until it finalizes. Remove the part we already
+    committed ourselves (matched by letters/digits, so spacing/punctuation edits don't matter)."""
+    if not committed:
+        return text
+    k = sum(ch.isalnum() for ch in committed)
+    n = 0
+    for i, ch in enumerate(text):
+        if n >= k:
+            return text[i:].lstrip(" .,;:!?…")
+        if ch.isalnum():
+            n += 1
+    return ""
+
+
+FORCE_FINAL_SEC = 1.0    # pause after which we finish the sentence ourselves if Gemini hasn't
 
 
 # ─── Audio capture ───────────────────────────────────────────────────────────
@@ -966,6 +989,8 @@ class GeminiEngine:
         self._running = False
         self._pid = 1
         self._awaiting_final = False
+        self._committed = ""        # text we finalized ourselves inside Gemini's still-open turn
+        self._last_interim = ""
         self._renew = False
         self._ever_connected = False
 
@@ -1021,6 +1046,7 @@ class GeminiEngine:
                     if "setupComplete" not in first:
                         raise RuntimeError(f"setup failed: {str(first)[:300]}")
                     log("gemini session open")
+                    self._committed, self._last_interim = "", ""
                     self.connected, self._renew, backoff = True, False, 1.0
                     self._ever_connected = True
                     self.on_status("READY")
@@ -1114,8 +1140,10 @@ class GeminiEngine:
             # source went quiet without delivering frames (e.g. device switch)
             if in_speech and now - last_frame_t > SILENCE_END + 0.2:
                 await end_turn()
-            if self._awaiting_final and now - final_wait_since > 4.0:
+            if self._awaiting_final and now - final_wait_since > FORCE_FINAL_SEC:
+                # Gemini only finalizes some languages after long silence: finish it ourselves
                 self._awaiting_final = False
+                self._force_final()
             # session renewal: only between sentences
             age = now - started
             if not in_speech and not self._awaiting_final and (self._renew or age > RENEW_AFTER):
@@ -1127,6 +1155,15 @@ class GeminiEngine:
                 return
             await asyncio.sleep(0.02)
 
+    def _force_final(self):
+        text = strip_committed(self._last_interim, self._committed)
+        if not text:
+            return
+        self._committed = self._last_interim
+        self.on_final(self._pid, text)
+        log(f"#{self._pid} (closed by pause): {text[:90]}")
+        self._pid += 1
+
     async def _recv_loop(self, ws):
         async for raw in ws:
             try:
@@ -1136,10 +1173,13 @@ class GeminiEngine:
             sc = m.get("serverContent") or {}
             it = sc.get("interimInputTranscription")
             if it is not None:
-                self.on_live(self._pid, clean_simple(it.get("text", "")))
+                full = clean_simple(it.get("text", ""))
+                self._last_interim = full
+                self.on_live(self._pid, strip_committed(full, self._committed))
             ft = sc.get("inputTranscription")
             if ft is not None:
-                text = clean_simple(ft.get("text", ""))
+                text = strip_committed(clean_simple(ft.get("text", "")), self._committed)
+                self._committed, self._last_interim = "", ""
                 self.on_final(self._pid, text)
                 if text:
                     log(f"#{self._pid}: {text[:90]}")
