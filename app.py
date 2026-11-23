@@ -120,6 +120,12 @@ LANGUAGES = [   # (name, Google code) — main languages first, then A-Z
     ("Galician", "gl"), ("Maltese", "mt"), ("Luxembourgish", "lb"), ("Esperanto", "eo"), ("Latin", "la"),
 ]
 LANG_NAME = {c: n for n, c in LANGUAGES}
+# Languages the speaker can talk in: (name, Whisper code, Gemini code)
+INPUT_LANGS = [("English", "en", "en-US"), ("Russian", "ru", "ru-RU"), ("Turkish", "tr", "tr-TR"),
+               ("Spanish", "es", "es-ES"), ("German", "de", "de-DE"), ("French", "fr", "fr-FR")]
+INPUT_NAME = {c: n for n, c, _ in INPUT_LANGS}
+INPUT_BCP  = {c: b for _, c, b in INPUT_LANGS}
+PTT_TAIL_SEC = 0.35      # keep listening this long after the talk key is released
 
 FONT_FAMILY = "Segoe UI" if os.name == "nt" else ("Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans")
 FONT_SIZE   = 22
@@ -300,9 +306,12 @@ class AudioCapture:
         self._sd = None
         self._sc = None
         self._lock = threading.Lock()
+        self.muted = False                # push-to-talk: True = key not held -> send silence
 
     def _put(self, frame):
         """Queue a frame; while an engine is still loading keep only the last BACKLOG_SEC."""
+        if self.muted:
+            frame = np.zeros_like(frame)
         q = self.out_q
         while q.qsize() > self._max_q:
             try:
@@ -538,8 +547,8 @@ def open_model(name, device, compute_type, **kw):
     except Exception:
         pass
     for alt in FALLBACKS:                       # any cached model will do
-        if alt == name:
-            continue
+        if alt == name or (alt.endswith(".en") and not name.endswith(".en")):
+            continue                            # English-only model can't do other languages
         try:
             m = WhisperModel(alt, device=device, compute_type=compute_type,
                              local_files_only=True, **kw)
@@ -638,10 +647,10 @@ class LocalEngine:
     """
     title = "Local"
 
-    def __init__(self, audio_q, on_live, on_final, on_status):
+    def __init__(self, audio_q, on_live, on_final, on_status, lang="en"):
         self.audio_q = audio_q
         self.on_live, self.on_final, self.on_status = on_live, on_final, on_status
-        self.language = LANGUAGE
+        self.language = lang or LANGUAGE
         self._final_q = queue.Queue()
         self._running = False
         self._models_lock = threading.Lock()
@@ -650,6 +659,12 @@ class LocalEngine:
         self.ready = False
         self._committed_tail = ""
         self.level = -90.0
+
+    def _models(self, device):
+        """(live, final) model names; English uses the faster English-only models."""
+        if self.language == "en":
+            return GPU_MODELS if device == "cuda" else CPU_MODELS
+        return ("small", "medium") if device == "cuda" else ("base", "small")
 
     def label(self):
         if self.device == "cuda":
@@ -676,14 +691,14 @@ class LocalEngine:
             return
         try:
             device = "cuda" if has_nvidia_driver() and gpu_libs_ready() else "cpu"
-            names = GPU_MODELS if device == "cuda" else CPU_MODELS
+            names = self._models(device)
             self.on_status(f"LOADING:Loading speech model on "
                            f"{'GPU — ' + HW['gpu'] if device == 'cuda' else 'CPU — ' + HW['cpu']}…")
             try:
                 live = get_model(names[0], device)
             except Exception as e:
                 log("GPU load failed, using CPU:", repr(e))
-                device, names = "cpu", CPU_MODELS
+                device, names = "cpu", self._models("cpu")
                 live = get_model(names[0], device)
             final = _MODEL_CACHE.get((names[1], device))
             with self._models_lock:
@@ -720,8 +735,8 @@ class LocalEngine:
             if not install_gpu_libs(lambda m: log(m)):
                 log("GPU lib install failed — staying on CPU")
                 return
-            live = get_model(GPU_MODELS[0], "cuda")
-            final = get_model(GPU_MODELS[1], "cuda")
+            live = get_model(self._models("cuda")[0], "cuda")
+            final = get_model(self._models("cuda")[1], "cuda")
             with self._models_lock:
                 self.live_model, self.final_model, self.device = live, final, "cuda"
             log("hot-switched to GPU")
@@ -941,7 +956,8 @@ class GeminiEngine:
 
     title = "Online"
 
-    def __init__(self, audio_q, api_key, on_live, on_final, on_status):
+    def __init__(self, audio_q, api_key, on_live, on_final, on_status, lang="en"):
+        self.lang = lang or "en"
         self.api_key = api_key
         self.on_live, self.on_final, self.on_status = on_live, on_final, on_status
         self.audio_q = audio_q
@@ -999,7 +1015,7 @@ class GeminiEngine:
                     await ws.send(json.dumps({"setup": {
                         "model": MODEL,
                         "generationConfig": {"responseModalities": ["TEXT"]},
-                        "inputAudioTranscription": {"languageCodes": SPEECH_LANGS},
+                        "inputAudioTranscription": {"languageCodes": [INPUT_BCP.get(self.lang, "en-US")]},
                     }}))
                     first = json.loads(await asyncio.wait_for(ws.recv(), 15))
                     if "setupComplete" not in first:
@@ -1136,13 +1152,14 @@ class GeminiEngine:
 
 # ─── Translation ─────────────────────────────────────────────────────────────
 
-def _gemini_translate(text, lang_code, key):
+def _gemini_translate(text, src_code, lang_code, key):
     import urllib.request, urllib.error
     lang = LANG_NAME.get(lang_code, lang_code)
+    src = INPUT_NAME.get(src_code, "English")
     body = json.dumps({
         "systemInstruction": {"parts": [{"text":
-            "You translate live English speech from an English lesson for the students. "
-            "Translate the user's text into " + lang + ". Keep the meaning natural and use the "
+            "You translate live " + src + " speech from a language lesson for the students. "
+            "Translate the user's " + src + " text into " + lang + ". Keep the meaning natural and use the "
             "standard grammar terms of that language. Reply with the translation only — no quotes, "
             "no notes. If the text is an unfinished sentence, translate it as unfinished."}]},
         "contents": [{"parts": [{"text": text}]}],
@@ -1165,24 +1182,27 @@ def _gemini_translate(text, lang_code, key):
     raise last
 
 
-def _google_translate(text, lang_code):
+def _google_translate(text, src_code, lang_code):
     """Backup: Google Translate's public web endpoint (no key)."""
     import urllib.request, urllib.parse
-    url = ("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&dt=t&tl="
+    url = ("https://translate.googleapis.com/translate_a/single?client=gtx&sl="
+           + urllib.parse.quote(src_code or "auto") + "&dt=t&tl="
            + urllib.parse.quote(lang_code) + "&q=" + urllib.parse.quote(text))
     with urllib.request.urlopen(url, timeout=8, context=ssl_context()) as r:
         j = json.load(r)
     return "".join(seg[0] for seg in j[0] if seg and seg[0]).strip()
 
 
-def translate(text, lang_code):
+def translate(text, src_code, lang_code):
+    if lang_code.split("-")[0] == (src_code or "en"):
+        return text                      # same language: nothing to translate
     key = load_api_key()
     if key:
         try:
-            return _gemini_translate(text, lang_code, key)
+            return _gemini_translate(text, src_code, lang_code, key)
         except Exception as e:
             log("gemini translate failed, using Google:", repr(e))
-    return _google_translate(text, lang_code)
+    return _google_translate(text, src_code, lang_code)
 
 
 class Translator:
@@ -1201,7 +1221,7 @@ class Translator:
     def _tr(self, text, lang):
         k = (text, lang)
         if k not in self._cache:
-            self._cache[k] = translate(text, lang)
+            self._cache[k] = translate(text, *lang)      # lang = (source, target)
             if len(self._cache) > 500:
                 self._cache.pop(next(iter(self._cache)))
         return self._cache[k]
@@ -1277,6 +1297,13 @@ class TeacherTalkingApp:
         self.mode = self.settings.get("mode", "online")
         # translation state
         self.tr_lang = self.settings.get("translate") or None
+        self.src_lang = self.settings.get("speak", "en")
+        if self.src_lang not in INPUT_NAME:
+            self.src_lang = "en"
+        # push-to-talk state
+        self.ptt = bool(self.settings.get("ptt", False))
+        self._talking = False
+        self._ptt_job = None
         self._tr_items = []           # [[sentence, translation-or-None], …] in spoken order
         self._tr_live = ""            # translation of the sentence still being spoken
         self._tr_live_src = ""
@@ -1295,11 +1322,14 @@ class TeacherTalkingApp:
         if self.capture.source == LOOPBACK and not IS_WIN:
             self.capture.source = ""
         self._update_src_label()
+        self.capture.muted = self.ptt
         self.capture.start()
         threading.Thread(target=detect_hardware, daemon=True).start()
         self._start_engine(self.mode)
 
         self.root.bind("<Escape>", lambda e: self._quit())
+        self.root.bind_all("<KeyPress-space>", self._ptt_down)
+        self.root.bind_all("<KeyRelease-space>", self._ptt_up)
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
         self._poll()
         self._pulse()
@@ -1314,9 +1344,9 @@ class TeacherTalkingApp:
                   on_final=lambda p, t: self._ui_q.put(("final", g, p, t)),
                   on_status=lambda m: self._ui_q.put(("status", g, m, None)))
         if mode == "local":
-            self.engine = LocalEngine(self.audio_q, **cb)
+            self.engine = LocalEngine(self.audio_q, lang=self.src_lang, **cb)
         else:
-            self.engine = GeminiEngine(self.audio_q, load_api_key(), **cb)
+            self.engine = GeminiEngine(self.audio_q, load_api_key(), lang=self.src_lang, **cb)
         self.mode = mode
         self._pending.clear()
         self._last_final = 0
@@ -1376,7 +1406,42 @@ class TeacherTalkingApp:
                                           columnbreak=(i > 0 and (i + 1) % 30 == 0),
                                           command=lambda c=code: self._set_tr_lang(c))
         self._tr_btn.configure(menu=self._tr_menu)
-        self._tr_btn.pack(side="right", padx=6, pady=8)
+        self._tr_btn.pack(side="right", padx=(2, 6), pady=8)
+
+        # swap + speaker-language picker (like Google Translate:  Spanish ⇄ Turkish)
+        tk.Button(top, text="⇄", font=(FONT_FAMILY, 12), bg="#f7f7f7", relief="flat", bd=0,
+                  activebackground="#e2e2e2", padx=4, command=self._swap_langs, takefocus=0
+                  ).pack(side="right", pady=8)
+        self._speak_var = tk.StringVar(value=self.src_lang)
+        self._speak_btn = tk.Menubutton(top, text="", font=(FONT_FAMILY, 10),
+                                        bg="#fef3c7", activebackground="#fde68a",
+                                        relief="flat", padx=12, pady=4)
+        self._speak_menu = tk.Menu(self._speak_btn, tearoff=0, font=(FONT_FAMILY, 10))
+        for name, code, _ in INPUT_LANGS:
+            self._speak_menu.add_radiobutton(label=name, variable=self._speak_var, value=code,
+                                             command=lambda c=code: self._set_src_lang(c))
+        self._speak_btn.configure(menu=self._speak_menu)
+        self._speak_btn.pack(side="right", padx=(6, 2), pady=8)
+        self._update_speak_label()
+
+        # recording mode: continuous / push-to-talk (left side, next to the status pill)
+        self._rec_var = tk.StringVar(value="ptt" if self.ptt else "cont")
+        self._rec_btn = tk.Menubutton(top, text="", font=(FONT_FAMILY, 10),
+                                      bg="#e2e2e2", activebackground="#d4d4d4",
+                                      relief="flat", padx=12, pady=4)
+        self._rec_menu = tk.Menu(self._rec_btn, tearoff=0, font=(FONT_FAMILY, 10))
+        self._rec_menu.add_radiobutton(label="🔁  Continuous recording", variable=self._rec_var,
+                                       value="cont", command=lambda: self._set_ptt(False))
+        self._rec_menu.add_radiobutton(label="✋  Push to talk (hold Space or the button)",
+                                       variable=self._rec_var, value="ptt",
+                                       command=lambda: self._set_ptt(True))
+        self._rec_btn.configure(menu=self._rec_menu)
+        self._rec_btn.pack(side="left", padx=(0, 6), pady=8)
+        self._hold_btn = tk.Label(top, text="", font=(FONT_FAMILY, 10, "bold"),
+                                  padx=14, pady=4, cursor="hand2")
+        self._hold_btn.bind("<ButtonPress-1>", self._ptt_down)
+        self._hold_btn.bind("<ButtonRelease-1>", self._ptt_up)
+        self._paint_rec()
 
         # Local / Online switch
         sw = tk.Frame(top, bg="#cfcfcf", padx=1, pady=1)
@@ -1432,15 +1497,98 @@ class TeacherTalkingApp:
         # big hint shown while the page is empty
         self._hint = tk.Label(frame, text="", font=(FONT_FAMILY, 26), fg="#b5b5b5", bg=BG_COLOR)
 
-        sb = tk.Scrollbar(frame, command=self._text.yview, width=6, bg="#ccc")
-        sb.place(in_=self._text, relx=1.0, rely=0, relheight=1, anchor="ne")
-        self._text.configure(yscrollcommand=sb.set)
 
         self._status_var = tk.StringVar(value="Starting…")
         tk.Label(self.root, textvariable=self._status_var, font=(FONT_FAMILY, 9),
                  bg="#f7f7f7", fg="#888", anchor="w"
                  ).pack(fill="x", side="bottom", padx=16, pady=(2, 6))
         self._apply_tr_layout()
+
+    # ── speaker language ──────────────────────────────────────────────────
+    def _update_speak_label(self):
+        self._speak_btn.configure(text=f"🗣 {INPUT_NAME[self.src_lang]} ▾")
+        self._speak_var.set(self.src_lang)
+
+    def _set_src_lang(self, code, restart=True):
+        if code not in INPUT_NAME:
+            return
+        changed = code != self.src_lang
+        self.src_lang = code
+        self.settings["speak"] = code
+        save_settings(self.settings)
+        self._update_speak_label()
+        if changed and restart:
+            self._tr_live, self._tr_live_src = "", ""
+            self._tr_seq += 1
+            self._start_engine(self.mode)        # recognizer must listen for the new language
+
+    def _swap_langs(self):
+        """Spanish → Turkish  becomes  Turkish → Spanish (only if the target can be spoken)."""
+        dst = (self.tr_lang or "").split("-")[0]
+        if dst not in INPUT_NAME:
+            self._status_var.set("Swap works when the translation language is English, Russian, "
+                                 "Turkish, Spanish, German or French")
+            return
+        old_src = self.src_lang
+        self._set_src_lang(dst, restart=False)
+        self._set_tr_lang(old_src)
+        self._start_engine(self.mode)
+
+    # ── push to talk ──────────────────────────────────────────────────────
+    def _paint_rec(self):
+        if self.ptt:
+            self._rec_btn.configure(text="✋ Push to talk ▾")
+            if self._talking:
+                self._hold_btn.configure(text="● Speaking…", bg=DOT_ON, fg="white")
+            else:
+                self._hold_btn.configure(text="Hold to speak (Space)", bg="#dbeafe", fg="#1e3a8a")
+            if not self._hold_btn.winfo_ismapped():
+                self._hold_btn.pack(side="left", padx=(0, 6), pady=8, after=self._rec_btn)
+        else:
+            self._rec_btn.configure(text="🔁 Continuous ▾")
+            self._hold_btn.pack_forget()
+
+    def _set_ptt(self, on):
+        self.ptt = on
+        self._rec_var.set("ptt" if on else "cont")
+        self.settings["ptt"] = on
+        save_settings(self.settings)
+        if self._ptt_job:
+            self.root.after_cancel(self._ptt_job)
+            self._ptt_job = None
+        self._talking = False
+        self.capture.muted = on
+        self._paint_rec()
+        self._status_var.set(self._status_line())
+        self._update_hint()
+
+    def _ptt_down(self, e=None):
+        if not self.ptt:
+            return None
+        if self._ptt_job:                      # key auto-repeat: keep talking
+            self.root.after_cancel(self._ptt_job)
+            self._ptt_job = None
+        if not self._talking:
+            self._talking = True
+            self.capture.muted = False
+            self._paint_rec()
+        return "break"
+
+    def _ptt_up(self, e=None):
+        if not self.ptt or not self._talking:
+            return None
+        if self._ptt_job:
+            self.root.after_cancel(self._ptt_job)
+        # short tail so the last word isn't cut (also absorbs key auto-repeat on Linux)
+        self._ptt_job = self.root.after(int(PTT_TAIL_SEC * 1000), self._ptt_stop)
+        return "break"
+
+    def _ptt_stop(self):
+        self._ptt_job = None
+        self._talking = False
+        if self.ptt:
+            self.capture.muted = True
+        self._paint_rec()
 
     # ── translation ───────────────────────────────────────────────────────
     def _apply_tr_layout(self):
@@ -1479,7 +1627,7 @@ class TeacherTalkingApp:
             for i, item in enumerate(self._tr_items):
                 item[1] = None if i >= len(self._tr_items) - 30 else ""
                 if item[1] is None:
-                    self.translator.final(i, item[0], code)
+                    self.translator.final(i, item[0], (self.src_lang, code))
             self._request_live_tr()
         self._render_translations()
 
@@ -1492,7 +1640,7 @@ class TeacherTalkingApp:
         self._tr_live_src = src
         self._tr_seq += 1
         if src:
-            self.translator.live(self._tr_seq, src, self.tr_lang)
+            self.translator.live(self._tr_seq, src, (self.src_lang, self.tr_lang))
         else:
             self._tr_live = ""
             self._render_translations()
@@ -1545,7 +1693,7 @@ class TeacherTalkingApp:
             self._hint.place_forget()
             return
         msg = {"loading": "Loading… please wait",
-               "ready": "Ready — start talking",
+               "ready": ("Ready — hold Space to talk" if self.ptt else "Ready — start talking"),
                "error": self._pill.cget("text")[3:]}[self._state]
         self._hint.configure(text=msg, fg="#2f9e55" if self._state == "ready" else "#b5b5b5")
         self._hint.place(relx=0.5, rely=0.25 if self.tr_lang else 0.42, anchor="center")
@@ -1594,7 +1742,7 @@ class TeacherTalkingApp:
         self._word_count += len(text.split())
         self._tr_items.append([text, None if self.tr_lang else ""])
         if self.tr_lang:
-            self.translator.final(len(self._tr_items) - 1, text, self.tr_lang)
+            self.translator.final(len(self._tr_items) - 1, text, (self.src_lang, self.tr_lang))
             self._tr_live, self._tr_live_src = "", ""      # the live line became this sentence
             self._tr_seq += 1
             self._render_translations()
@@ -1660,7 +1808,9 @@ class TeacherTalkingApp:
 
     def _status_line(self):
         src = self.capture.active_name or "…"
-        return f"{self.engine.label()}  |  Source: {src}  |  {self._word_count} words  |  Esc to exit"
+        mode = "Push to talk — hold Space" if self.ptt else "Continuous"
+        return (f"{self.engine.label()}  |  Speaking: {INPUT_NAME[self.src_lang]}  |  {mode}  |  "
+                f"Source: {src}  |  {self._word_count} words  |  Esc to exit")
 
     # ── buttons ───────────────────────────────────────────────────────────
     def _clear(self):
@@ -1693,7 +1843,10 @@ class TeacherTalkingApp:
 
     def _pulse(self):
         lvl = self.engine.level if self.engine else -90
-        self._dot.configure(fg=DOT_ON if lvl > -45 else DOT_OFF)
+        if self.ptt and not self._talking:
+            self._dot.configure(fg="#c8c8c8")          # mic closed until Space is held
+        else:
+            self._dot.configure(fg=DOT_ON if lvl > -45 else DOT_OFF)
         self.root.after(80, self._pulse)
 
     # ── audio-source picker ───────────────────────────────────────────────
@@ -1806,7 +1959,7 @@ def selftest():
     lines.append("builtin key: " + ("yes" if builtin_key() else "NO"))
     if os.environ.get("BTT_SELFTEST_TRANSLATE"):
         try:
-            tr = translate("Good morning, everyone.", "tr")
+            tr = translate("Good morning, everyone.", "en", "tr")
             lines.append(f"ok   translation to Turkish: {tr}")
             if not tr:
                 ok = False
