@@ -310,6 +310,48 @@ def strip_committed(text, committed):
     return ""
 
 
+# ── "only the chosen language" filter (Gemini treats the language as a hint only) ──
+_LANG_WORDS = {
+    "en": """the and is are was were you your to of in it that this these we they what where when why
+             how have has be will would can could do does did not my me our for with on at from
+             good morning afternoon evening hello hi everyone today please thank thanks yes okay so now
+             let let's open page book books student students teacher lesson study verbs very about there""",
+    "es": """el la los las del que y es un una por con para no se lo como más pero sus le ya este esta
+             sí porque muy hoy vamos estudiar buenos buenas días tardes noches hola gracias todos todas
+             por favor bien estoy está están soy eres somos tengo hay qué cómo dónde cuándo también""",
+    "de": """der die das und ist nicht ich sie es ein eine einen zu den dem mit auf für von wir ihr
+             auch sich bitte heute guten morgen tag abend hallo danke alle ja nein gut sehr was wie
+             wo wann warum haben habe hat sind bin bist wird werden kann können""",
+    "fr": """le les et est un une des du je vous nous pas que qui dans pour avec ce cette sur il elle
+             bonjour bonsoir merci aujourd tous toutes oui non bien très suis sont avez avons fait
+             comment où quand pourquoi aussi mais plus leçon page livre""",
+    "tr": """ve bir bu şu da ne için ile çok ben sen biz siz mi mı mu mü değil var yok gibi ama
+             şimdi lütfen merhaba günaydın iyi akşamlar teşekkür teşekkürler evet hayır bugün herkes
+             nasıl nerede neden sayfa kitap ders öğrenci öğretmen""",
+}
+_LANG_WORDS = {k: set(v.split()) for k, v in _LANG_WORDS.items()}
+_LANG_CHARS = {"es": "ñ¿¡", "de": "äß", "fr": "çàâèêëîïôûùœ", "tr": "ğışİ"}
+
+
+def wrong_language(text, want):
+    """True only when the text is clearly in another language than `want` (unsure -> False)."""
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 8:
+        return False
+    cyr = sum("\u0400" <= c <= "\u04ff" for c in letters) / len(letters)
+    if want == "ru":
+        return cyr < 0.3
+    if cyr > 0.5:
+        return True
+    low = text.lower()
+    words = re.findall(r"[^\W\d_]+", low)
+    score = {}
+    for lang, vocab in _LANG_WORDS.items():
+        score[lang] = sum(w in vocab for w in words) + 2 * sum(c in _LANG_CHARS.get(lang, "") for c in low)
+    best = max(score, key=score.get)
+    return best != want and score[best] >= 2 and score[best] >= 2 * score.get(want, 0) + 1
+
+
 FORCE_FINAL_SEC = 1.0    # pause after which we finish the sentence ourselves if Gemini hasn't
 
 
@@ -1160,6 +1202,9 @@ class GeminiEngine:
         if not text:
             return
         self._committed = self._last_interim
+        if wrong_language(text, self.lang):
+            log(f"ignored (not {self.lang}): {text[:90]}")
+            text = ""
         self.on_final(self._pid, text)
         log(f"#{self._pid} (closed by pause): {text[:90]}")
         self._pid += 1
@@ -1175,11 +1220,15 @@ class GeminiEngine:
             if it is not None:
                 full = clean_simple(it.get("text", ""))
                 self._last_interim = full
-                self.on_live(self._pid, strip_committed(full, self._committed))
+                live = strip_committed(full, self._committed)
+                self.on_live(self._pid, "" if wrong_language(live, self.lang) else live)
             ft = sc.get("inputTranscription")
             if ft is not None:
                 text = strip_committed(clean_simple(ft.get("text", "")), self._committed)
                 self._committed, self._last_interim = "", ""
+                if wrong_language(text, self.lang):
+                    log(f"ignored (not {self.lang}): {text[:90]}")
+                    text = ""
                 self.on_final(self._pid, text)
                 if text:
                     log(f"#{self._pid}: {text[:90]}")
@@ -1663,11 +1712,7 @@ class TeacherTalkingApp:
         self._apply_tr_layout()
         self._tr_live, self._tr_live_src = "", ""
         self._tr_seq += 1
-        if code:      # re-translate what is on screen (latest 30 sentences)
-            for i, item in enumerate(self._tr_items):
-                item[1] = None if i >= len(self._tr_items) - 30 else ""
-                if item[1] is None:
-                    self.translator.final(i, item[0], (self.src_lang, code))
+        if code:      # only new sentences use the new language; earlier ones keep their translation
             self._request_live_tr()
         self._render_translations()
 
